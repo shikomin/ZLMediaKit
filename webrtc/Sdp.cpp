@@ -589,7 +589,15 @@ string SdpAttrRtcpFb::toString() const {
 
 void SdpAttrFmtp::parse(const string &str) {
     auto pos = str.find(' ');
-    CHECK_SDP(pos != string::npos);
+    // 兼容 a=fmtp:<pt> 不带参数的情况(部分摄像机/NVR 的 SDP 如此)，它等价于没有 fmtp 参数，
+    // 不能按解析失败处理，否则整段 SDP 解析失败，WebRTC 播放会直接返回 400
+    // Compatible with a=fmtp:<pt> without parameters (as some cameras/NVRs write it): it means no
+    // fmtp parameter, and must not fail the whole SDP parsing which breaks WebRTC playback with 400
+    if (pos == string::npos) {
+        CHECK_SDP(!str.empty());
+        pt = atoi(str.data());
+        return;
+    }
     pt = atoi(str.substr(0, pos).data());
     auto vec = split(str.substr(pos + 1), ";");
     for (auto &item : vec) {
@@ -799,6 +807,7 @@ void RtcSession::loadFrom(const string &str) {
             rtc_media.fingerprint = sdp.getItemClass<SdpAttrFingerprint>('a', "fingerprint");
         }
         rtc_media.ice_lite = media.getItem('a', "ice-lite").operator bool();
+        rtc_media.bundle_only = media.getItem('a', "bundle-only").operator bool();
         auto ice_options = media.getItemClass<SdpAttrIceOption>('a', "ice-options");
         rtc_media.ice_trickle = ice_options.trickle;
         rtc_media.ice_renomination = ice_options.renomination;
@@ -1659,6 +1668,15 @@ static DtlsRole mathDtlsRole(DtlsRole role) {
     }
 }
 
+static uint16_t getAnswerMediaPort(const RtcMedia &offer_media) {
+    // RFC 8843: bundle-only m-lines may use port=0 in the offer but still need a
+    // real port placeholder in the accepted answer.
+    if (!offer_media.port && offer_media.bundle_only) {
+        return 9;
+    }
+    return offer_media.port;
+}
+
 void RtcConfigure::createMediaOffer(const std::shared_ptr<RtcSession> &ret) const {
     int index = 0;
     if (video.direction != RtpDirection::sendonly || _rtsp_video_plan)  {
@@ -1678,7 +1696,7 @@ void RtcConfigure::createMediaOfferEach(const std::shared_ptr<RtcSession> &ret, 
         audio_list_ref.emplace(CodecG711U, make_shared<AudioRtpMap>("PCMU", 0, 8000));
         audio_list_ref.emplace(CodecG711A, make_shared<AudioRtpMap>("PCMA", 8, 8000));
         audio_list_ref.emplace(CodecOpus, make_shared<AudioRtpMap>("opus", 111, 48000));
-        audio_list_ref.emplace(CodecAAC, make_shared<AudioRtpMap>("mpeg4-generic", 96, 48000));
+        audio_list_ref.emplace(CodecAAC, make_shared<AudioRtpMap>("mpeg4-generic", 112, 48000));
 
         video_list_ref.emplace(CodecH264, make_shared<H264RtpMap>(102, 90000, PROFILE_H264_BASELINE));
         video_list_ref.emplace(CodecH264, make_shared<H264RtpMap>(104, 90000, PROFILE_H264_MAIN));
@@ -1826,6 +1844,7 @@ RETRY:
 
     if (offer_media.type == TrackApplication) {
         RtcMedia answer_media = offer_media;
+        answer_media.port = getAnswerMediaPort(offer_media);
         answer_media.role = mathDtlsRole(offer_media.role);
         answer_media.ice_ufrag = configure.ice_ufrag;
         answer_media.ice_pwd = configure.ice_pwd;
@@ -1871,7 +1890,7 @@ RETRY:
         answer_media.type = offer_media.type;
         answer_media.mid = offer_media.mid;
         answer_media.proto = offer_media.proto;
-        answer_media.port = offer_media.port;
+        answer_media.port = getAnswerMediaPort(offer_media);
         answer_media.addr = offer_media.addr;
         answer_media.bandwidth = offer_media.bandwidth;
         answer_media.rtcp_addr = offer_media.rtcp_addr;
@@ -2073,6 +2092,10 @@ void RtcConfigure::onSelectPlan(RtcCodecPlan &plan, CodecId codec) const {
         auto mode = _rtsp_video_plan->fmtp[kMode];
         GET_CONFIG(bool, h264_stap_a, Rtp::kH264StapA);
         plan.fmtp[kMode] = mode.empty() ? std::to_string(h264_stap_a) : mode;
+    }
+    if (_rtsp_audio_plan && codec == CodecAAC && getCodecId(_rtsp_audio_plan->codec) == CodecAAC) {
+        // aac时，设置fmtp
+        plan.fmtp = _rtsp_audio_plan->fmtp;
     }
 }
 
